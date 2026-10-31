@@ -1,0 +1,17 @@
+# PoC replica of microsoft/hve-core "Demo Material Author" (legitimate version).
+# The real workflow only runs on schedule/workflow_dispatch; the attacker's fork
+# version of this same file is what runs on the pull_request event.
+name: Demo Material Author
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  author:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Legitimate authoring
+        run: echo "legit author run (not attacker controlled in the base repo)"

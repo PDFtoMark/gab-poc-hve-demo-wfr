@@ -1,0 +1,220 @@
+# PoC replica of the security-relevant part of microsoft/hve-core
+# .github/workflows/demo-material-render.yml: a privileged workflow_run
+# consumer that tries to prove the triggering "author run" is a successful
+# default-branch run of .github/workflows/demo-material-author.lock.yml before
+# consuming its artifact.
+name: Demo Material Render
+
+on:
+  workflow_run:
+    workflows:
+      - Demo Material Author
+    branches:
+      - main
+    types:
+      - completed
+
+permissions: {}
+
+jobs:
+  resolve:
+    name: Resolve render inputs
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      mode: ${{ steps.resolve.outputs.mode }}
+      levels: ${{ steps.levels.outputs.levels || '[]' }}
+      author-run-id: ${{ steps.resolve.outputs.author-run-id }}
+      content-artifact-id: ${{ steps.resolve.outputs.content-artifact-id }}
+      source-sha: ${{ steps.resolve.outputs.source-sha }}
+    steps:
+      - name: Dump the workflow_run payload
+        run: |
+          jq -c '{event:.workflow_run.event,name:.workflow_run.name,path:.workflow_run.path,head_branch:.workflow_run.head_branch,head_sha:.workflow_run.head_sha,head_repo:.workflow_run.head_repository.full_name,fork:.workflow_run.head_repository.fork,conclusion:.workflow_run.conclusion,run_id:.workflow_run.id}' "$GITHUB_EVENT_PATH"
+
+      - name: Checkout the default branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Prove the checkout is the default branch, not the fork head
+        run: |
+          set -euo pipefail
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "GITHUB_REF=$GITHUB_REF"
+          echo "CHECKOUT_HEAD=$(git rev-parse HEAD)"
+          if [ -f attacker-marker.txt ]; then
+            echo "ATTACKER_MARKER_IN_CHECKOUT=true"
+          else
+            echo "ATTACKER_MARKER_IN_CHECKOUT=false"
+          fi
+          head -20 .github/workflows/demo-material-author.yml
+
+      # Same trust decision as the target workflow's "Resolve author run and render mode".
+      - name: Resolve author run and render mode
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: repository } = await github.rest.repos.get({ ...context.repo });
+            const defaultBranch = repository.default_branch;
+
+            const findArtifact = async (runId, name) => {
+              const artifacts = await github.paginate(
+                github.rest.actions.listWorkflowRunArtifacts,
+                { ...context.repo, run_id: runId, per_page: 100 },
+              );
+              const matches = artifacts.filter((a) => !a.expired && a.name === name);
+              return matches.length === 1 ? matches[0] : null;
+            };
+
+            let authorRun = null;
+            if (context.eventName === "workflow_run") {
+              authorRun = context.payload.workflow_run;
+            }
+
+            if (authorRun) {
+              console.log(JSON.stringify({
+                default_branch: defaultBranch,
+                path: authorRun.path,
+                head_branch: authorRun.head_branch,
+                head_sha: authorRun.head_sha,
+                head_repo: authorRun.head_repository && authorRun.head_repository.full_name,
+                conclusion: authorRun.conclusion,
+              }, null, 2));
+              if (authorRun.conclusion !== "success" ||
+                  authorRun.path !== ".github/workflows/demo-material-author.yml" ||
+                  authorRun.head_branch !== defaultBranch ||
+                  !/^[0-9a-f]{40}$/.test(authorRun.head_sha)) {
+                core.notice("Author run is not a successful default-branch Demo Material Author run; nothing to render.");
+                core.setOutput("mode", "skip");
+                return;
+              }
+              const content = await findArtifact(authorRun.id, `demo-material-content-${authorRun.id}`);
+              if (!content) {
+                core.notice("Author run produced no content artifact; nothing to render.");
+                core.setOutput("mode", "skip");
+                return;
+              }
+              core.setOutput("mode", "render");
+              core.setOutput("source-sha", authorRun.head_sha);
+              core.setOutput("author-run-id", String(authorRun.id));
+              core.setOutput("content-artifact-id", String(content.id));
+              return;
+            }
+            core.setOutput("mode", "skip");
+
+      - name: Download authored content
+        if: ${{ steps.resolve.outputs.mode == 'render' }}
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.resolve.outputs.content-artifact-id }}
+          run-id: ${{ steps.resolve.outputs.author-run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/content
+
+      # Same allowlist / provenance shape check as the target workflow.
+      - name: Validate authored content
+        id: levels
+        if: ${{ steps.resolve.outputs.mode == 'render' }}
+        shell: bash
+        env:
+          CONTENT: ${{ runner.temp }}/content
+          AUTHOR_RUN_ID: ${{ steps.resolve.outputs.author-run-id }}
+          SOURCE_SHA: ${{ steps.resolve.outputs.source-sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+
+          root = Path(os.environ["CONTENT"])
+          allowed = re.compile(
+              r"^(provenance\.json|L[1-4]00/(content/slide-\d{3}/content\.yaml"
+              r"|content/global/style\.yaml|research/source-register\.md"
+              r"|capture-plan\.yml|manifest\.yml))$"
+          )
+          for path in root.rglob("*"):
+              if path.is_symlink():
+                  raise SystemExit(f"symlink in authored content: {path}")
+              if path.is_file() and not allowed.match(path.relative_to(root).as_posix()):
+                  raise SystemExit(f"unexpected file in authored content: {path}")
+          provenance = json.loads((root / "provenance.json").read_text(encoding="utf-8"))
+          if (provenance.get("schema_version") != "demo-material-content/v1"
+                  or provenance.get("author_run_id") != os.environ["AUTHOR_RUN_ID"]
+                  or provenance.get("source_sha") != os.environ["SOURCE_SHA"]):
+              raise SystemExit("content provenance is not bound to the author run")
+          levels = provenance.get("levels", [])
+          if not all(re.fullmatch(r"L[1-4]00", level) and (root / level / "content").is_dir()
+                     for level in levels):
+              raise SystemExit(f"invalid level list in provenance: {levels}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"levels={json.dumps(levels)}\n")
+          print(f"Levels to render: {levels}")
+          PY
+
+      - name: Show the content the privileged run accepted
+        if: ${{ steps.resolve.outputs.mode == 'render' }}
+        run: |
+          set -euo pipefail
+          echo "ACCEPTED_LEVELS=${{ steps.levels.outputs.levels }}"
+          echo "ATTACKER_CONTENT_ACCEPTED=true"
+          find "${RUNNER_TEMP}/content" -type f -print
+          echo "--- attacker slide content.yaml ---"
+          cat "${RUNNER_TEMP}/content/L100/content/slide-001/content.yaml"
+
+  publish:
+    name: Publish site bundle
+    needs:
+      - resolve
+    if: ${{ needs.resolve.outputs.mode == 'render' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      - name: Download authored content
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.resolve.outputs.content-artifact-id }}
+          run-id: ${{ needs.resolve.outputs.author-run-id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/content
+
+      - name: Assemble the bundle from renderer output
+        run: |
+          set -euo pipefail
+          mkdir -p site/L100
+          # The real pipeline renders content/L100 into these files with trusted
+          # scripts and publishes the level directory verbatim.
+          cp "${RUNNER_TEMP}/content/L100/content/slide-001/content.yaml" site/L100/index.html
+          printf '{"schema_version":"demo-material-site/v1","levels":{"L100":{"rendered":true}}}\n' > site/index.json
+          find site -type f
+
+      - name: Upload the site bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-material-site-${{ github.run_id }}
+          path: site
+
+  dispatch-deploy:
+    name: Start the documentation deploy
+    needs: publish
+    if: ${{ needs.publish.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the documentation deploy for this run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: repository } = await github.rest.repos.get({ ...context.repo });
+            await github.rest.actions.createWorkflowDispatch({
+              ...context.repo,
+              workflow_id: "deploy-probe.yml",
+              ref: repository.default_branch,
+              inputs: { "source-run-id": String(context.runId) },
+            });
+            console.log("DEPLOY_DISPATCHED_FOR_RUN=" + context.runId);
